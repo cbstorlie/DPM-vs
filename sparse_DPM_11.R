@@ -13,6 +13,566 @@ registerDoMC()
 
 
 
+##############################################################
+######### DPM CLustering w/ Variable Selection MCMC ##########
+##############################################################
+
+
+DPMvs.MCMC <- function(y, rho=.5, p.ad=.45, p.swap=.45, A.lambda=1, B.lambda=1, prop.sd.lambda=.5, P.Psi=NULL, N.Psi=NULL, A.eta=1, B.eta=.1, prop.sd.eta=.5, A.delta=1, B.delta=.1, prop.sd.delta=NULL, N.mcmc=5000, every=1, nplot=10, nback=1000, dfp=20, maxplot=100, gamma.init=NULL, phi.init=NULL, G=2:5, begin=0, bsy=3, prop.sd.y.m=.25, prop.sd.y.d=.25, prop.sd.y.c=.25, etagp=1, TT=2, Lg=200, Lgp=20, Lgy=0, Lpy=0, Lgpy=0, discrete=NULL, limits=NULL, prop.sd.y1=NULL, prop.sd.y2=NULL, yc.init=NULL, Ly.init=100, groups=NULL){
+
+#############
+## Inputs: ##
+#############
+#
+# See "Clustering and Variable Selection in the Presence of Mixed Variable Types and Missing Data" by Storlie et.al. for more detailed definitions of variable names.
+#
+# y - a matrix or data frame n (observations) rows by p (variables) columns.  Recommend that y is standardized to have unit variances for each column.
+# rho - the prior probability that a variable is informative.  Can be a scalar or a vector of values length p.
+# limits - a p x 2 matrix of limits for each variable.  Defaults to -Inf, Inf.
+# discrete - a vector of length p of 0s and 1s, to indicate continuous or discrete, respectively, for each variable.
+# p.ad - probability of proposing the adding/deleting of a variable in the gamma update for informative variables
+# p.swap - probability of proposing a swap move in the gamma update for informative variables
+# A.lambda, B.lambda - Prior on lambda is Gamma(A.lambda, B.lambda)
+# prop.sd.lambda - scale parameter for lambda proposals
+# P.Psi, N.Psi - Prior for Psi is Wishart(P.Psi, N.Psi), defaults to a diagonal matrix for P.Psi of the variances for y (or identity if using standardized y as recommended).  N.Psi defaults to (p+1)*1.1
+# 
+# TT - number of restricted Gibbs sample updates to perform before proposing a split in the split/merge update
+# A.eta, B.eta - Prior on eta is: eta = p + etagp + Gamma(A.lambda, B.lambda)
+# prop.sd.eta - scale parameter for eta proposals
+# A.delta, B.delta - Prior on delta is Gamma(A.lambda, B.lambda)
+# prop.sd.delta - scale parameter for delta proposals
+# N.mcmc - number of MCMC iterations to run
+# begin - begin saving MCMC iterations at the 'begin'-th iteration.
+# every - record/save the parameters every 'every' iterations.
+# nplot - plot progress every 'nplot' iterations.
+# nback - use samples from current iteration back to 'nback' iterations for progress plots
+# dfp - degrees of freedom for scaled t distribution proposals.
+# maxplot - maximum number of frames to plot in progress plots.
+# gamma.init - starting values for gamma, defaults to updating Z several (Ly.init) times assuming one cluster, then running clustvarsel on the resulting Z.
+# phi.init - starting values for phi; defaults to the resulting phi from Mclust after following the process above to obtain gamma.init
+# G - the possible number of clusters to try for inititializing gamma and phi.  Ignored if phi.init is specified.
+# bsy - number of observations to block update at one time when updating Z.
+# prop.sd.y.m - scale parameter for proposals of Z for missing data elements.
+# prop.sd.y.d - scale parameter for proposals for latent Z for observed, but discrete variables
+# prop.sd.y.c - scale parameter for proposals for latent Z for observed, continuous, but censored variables
+# etagp - see definition for A.eta, B.eta and the prior on eta above.
+# Lg - the number of times to perform an MH update of gamma each sweep of the MCMC.
+# Lgp - the number of times to perform an MH update of (gamma, phi), jointly, each sweep of the MCMC.
+# Lgy - the number of times to perform an MH update of (gamma, Z), jointly, each sweep of the MCMC.
+# Lpy - the number of times to perform an MH update of (phi, Z), jointly, each sweep of the MCMC.
+# Lgpy - the number of times to perform an MH update of (gamma, phi, Z), jointly, each sweep of the MCMC.
+# yc.init - initial values for Z (yc in the code is the latent Z in the paper).  Defaults to updating Z several (Ly.init) times assuming one cluster, with each missing value initialied as N(0, sd(y[,j])), each discrete variable set to its discrete value in y, and each censored value set to its cenored value in y.
+# Ly.init - see yc.init and gamma.init
+# groups - not supported, intended to specify distinct groups of variables, and at least one variable from each group must be chosen as informative.
+
+##############
+## Outputs: ##
+##############
+
+# gamma - N x p matrix, posterior sample of gamma, where N is the number of recorded MCMC iterations.
+# phi - N x n matrix, posterior sample of phi.
+# yc - N x M matrix, posterior sample for the latent values of y (i.e., \tilde{Z}).  M is the number of missing, discrete, or censored values in y.
+# lambda - N-vector, posterior sample for lambda
+# Psi - N x p x p array, posterior sample for Psi
+# eta - N-vector, posterior sample for eta
+# delta - N-vector, posterior sample for delta
+# y, rho, p.ad, p.swap, prop.sd.y.m, prop.sd.y.d, prop.sd.y.c, prop.sd.y2, bsy, - the values that were input for these variables, respectively.
+
+
+
+ ## Create needed variables ##
+  n <- nrow(y)
+  p <- ncol(y)
+  if(is.null(prop.sd.y1))
+    prop.sd.y1 <- prop.sd.y.m
+  if(is.null(prop.sd.y2))
+    prop.sd.y2 <- prop.sd.y.d
+  if(is.null(discrete))
+    discrete <- rep(FALSE,p)
+  if(is.null(limits))
+    limits <- cbind(rep(-Inf,p), rep(Inf,p))
+  if(is.null(colnames(y)))
+    colnames(y) <- paste("y_",1:p,sep="")
+  if(length(rho)==1)
+    rho <- rep(rho, p)
+  if(is.null(groups))
+    groups <- rep(1,p)
+
+  if(is.null(N.Psi))
+    N.Psi <- (p+1)*1.1
+  if(is.null(P.Psi))
+    P.Psi <- diag(apply(y,2,var,na.rm=TRUE))
+  lambda.now <- A.lambda/B.lambda
+  eta.now <- A.eta/B.eta + p + etagp
+  delta.now <- A.delta/B.delta
+  Psi.now <- P.Psi*N.Psi
+
+ ## initialize yc, phi, gamma, mu, Sigma, Beta, Gamma
+  cat("\nInitializing Clusters \n")
+  ans.init <- initialize.clusters(y, G, lambda.now, eta.now, Psi.now, bsy, prop.sd.y.m, prop.sd.y.d, prop.sd.y.c, gamma.init, phi.init, discrete, limits, yc.init, Ly.init, groups)
+  yc.now <- ans.init$yc.now
+  phi.now <- ans.init$phi.now
+  gamma.now <- ans.init$gamma.now
+
+cat("\nAllocating Memory for Posterior Objects \n")
+
+ ## Allocate posterior objects for which to store MCMC samples
+  gamma <- matrix(0, (N.mcmc-begin)%/%every, p)
+  phi <- matrix(0, (N.mcmc-begin)%/%every, n)
+  lambda <- rep(0, (N.mcmc-begin)%/%every)
+  Psi <- array(0, c((N.mcmc-begin)%/%every, p, p))
+  eta <- rep(0, (N.mcmc-begin)%/%every)
+  delta <- rep(0, (N.mcmc-begin)%/%every)
+  NN <- length(y)
+  yc <- matrix(0, (N.mcmc-begin)%/%every, NN)
+  
+  accept.gamma <- rep(0, N.mcmc)
+  accept.phi <- rep(0, N.mcmc)
+  accept.gp <- rep(0, N.mcmc)
+  accept.gy <- rep(0, N.mcmc)
+  accept.py <- rep(0, N.mcmc)
+  accept.gpy <- rep(0, N.mcmc)
+  accept.lambda <- rep(0, N.mcmc)
+  accept.Psi <- rep(0, N.mcmc)
+  accept.eta <- rep(0, N.mcmc)
+  accept.delta <- rep(0, N.mcmc)
+
+  nb <- ceiling(n/bsy)
+  accept.yc.m <- rep(0, n)
+
+ ################
+ ## Begin MCMC ##
+ ################
+ cat("\n")
+  for(it in 1:N.mcmc){
+
+  cat("\nIteration", it, "out of", N.mcmc)
+
+
+discrete..<<-discrete
+
+#print("y update")
+    ans.yc <- update.yc(yc.now, y, phi.now, gamma.now, lambda.now, eta.now, Psi.now, bsy, prop.sd.y.m, prop.sd.y.d, prop.sd.y.c, discrete, limits)
+    yc.now <- ans.yc$yc.now
+    accept.yc.m <- accept.yc.m + ans.yc$accept.m
+
+#print("gamma update")
+  ## Update gamma
+  ans.gamma <- update.gamma(gamma.now, p.ad, p.swap, yc.now, phi.now, lambda.now, eta.now, Psi.now, rho, Lg, groups)
+  gamma.now <- ans.gamma$gamma
+  accept.gamma[it] <- ans.gamma$accept
+
+
+
+#print("phi split/merge update")
+#phi.now<<-phi.now
+#yc.now<<-yc.now
+#gamma.now<<-gamma.now
+#lambda.now<<-lambda.now
+#eta.now<<-eta.now
+#Psi.now<<-Psi.now
+#delta.now<<-delta.now
+
+    ans.phi <- update.phi.sm(phi.now, yc.now, gamma.now, lambda.now, eta.now, Psi.now, delta.now, TT)
+    phi.now <- ans.phi$phi
+    accept.phi[it] <- ans.phi$accept
+
+#print("gamma & y joint update")
+    ans.gy <- update.gamma.y(gamma.now, p.ad, p.swap, yc.now, y, phi.now, lambda.now, eta.now, Psi.now, rho, Lgy, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
+    gamma.now <- ans.gy$gamma
+    yc.now <- ans.gy$yc
+    accept.gy[it] <- ans.gy$accept
+
+
+#print("phi & y joint update")
+    ans.py <- update.phi.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, Lpy, discrete, limits, prop.sd.y1, prop.sd.y2)
+    phi.now <- ans.py$phi
+    yc.now <- ans.py$yc
+    accept.py[it] <- ans.py$accept
+
+
+#print("gamma phi & y joint update")
+#  if(runif(1)<1)
+#    ans.gpy <- update.gamma.phi.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, delta.now, Lgpy, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
+#  else
+#    ans.gpy <- update.gamma.phi.sm.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, delta.now, TT, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
+#    gamma.now <- ans.gpy$gamma
+#    phi.now <- ans.gpy$phi
+#    yc.now <- ans.gpy$yc
+#    accept.gpy[it] <- ans.gpy$accept
+
+
+#print("gamma & phi joint update")
+    if(runif(1)<.5)
+      ans.gp <- update.gamma.phi(gamma.now, phi.now, p.ad, p.swap, yc.now, lambda.now, eta.now, Psi.now, rho, delta.now, Lgp, groups)
+    else
+      ans.gp <- update.gamma.phi.sm(gamma.now, phi.now, p.ad, p.swap, yc.now, lambda.now, eta.now, Psi.now, rho, delta.now, TT, groups)
+    gamma.now <- ans.gp$gamma
+    phi.now <- ans.gp$phi
+    accept.gp[it] <- ans.gp$accept
+
+
+
+#print("phi Gibbs update")
+    phi.now <- update.phi(phi.now, yc.now, gamma.now, lambda.now, eta.now, Psi.now, delta.now)
+
+
+#print("delta update")
+    ans.delta <- update.delta(delta.now, phi.now, A.delta, B.delta, prop.sd.delta, dfp)
+    delta.now <- ans.delta$delta.now
+    accept.delta[it] <- ans.delta$accept
+
+
+#print("lambda update")
+    ans.lambda <- update.lambda(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, A.lambda, B.lambda, prop.sd.lambda, dfp)
+    lambda.now <- ans.lambda$lambda.now
+    accept.lambda[it] <- ans.lambda$accept
+
+
+#print("Psi update")
+    ans.Psi <- update.Psi(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, P.Psi, N.Psi)
+    Psi.now <- ans.Psi$Psi.now
+    accept.Psi[it] <- ans.Psi$accept
+
+
+#print("eta update")
+    ans.eta <- update.eta(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, A.eta, B.eta, prop.sd.eta, dfp, etagp)
+    eta.now <- ans.eta$eta
+    accept.eta[it] <- ans.eta$accept
+    
+
+#print("End of Updates")
+
+   ## record params.now in posterior sample
+    if(it>begin && (it-begin)%%every==0){
+
+      yc[(it-begin)/every,] <- yc.now
+      gamma[(it-begin)/every,] <- gamma.now
+      phi[(it-begin)/every,] <- phi.now
+      lambda[(it-begin)/every] <- lambda.now
+      Psi[(it-begin)/every,,] <- Psi.now
+      eta[(it-begin)/every] <- eta.now
+      delta[(it-begin)/every] <- delta.now
+     }
+
+yc.now..<<-yc.now
+
+   ## Summarize and Plot posterior
+    if((it-begin)%%nplot==0){
+      ncv <- sum(gamma.now)
+      N.plots <- min(maxplot, max(1,choose(ncv,2)) + 2)
+      cols <- min(13, ceiling(sqrt(N.plots)))
+      rows <- min(13, ceiling(N.plots/cols))
+      it.e <- floor((it-begin)/every)
+      ind.now <- max(1,floor(it.e/2),it.e-nback+1):max(1,it.e)
+      par(mfrow=c(rows,cols), mar=c(2,2,2,1))
+
+     ## Print likelihood
+      like.y <- get.like(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now)
+      cat("\nlog(like) =",like.y,"\n")
+
+     ## Print model
+      cat("\ngamma =",gamma.now,"\n")
+
+     ## Print acceptance %
+      cat("\ngamma acceptance = ", mean(accept.gamma[1:it]))
+      cat("\nphi acceptance = ", mean(accept.phi[1:it]))
+      cat("\ngamma & y acceptance = ", mean(accept.gy[1:it]))
+      cat("\nphi & y acceptance = ", mean(accept.py[1:it]))
+      cat("\ngamma phi & y acceptance = ", mean(accept.gpy[1:it]))
+      cat("\ngamma & phi acceptance = ", mean(accept.gp[1:it]))
+      cat("\nlambda acceptance = ", mean(accept.lambda[1:it]))
+      cat("\nPsi acceptance = ", mean(accept.Psi[1:it]))
+      cat("\neta acceptance = ", mean(accept.eta[1:it]))
+      cat("\ndelta acceptance = ", mean(accept.delta[1:it]))
+      cat("\nyc acceptance = ", summary(accept.yc.m/it))
+      cat("\n\n\n")
+    }
+    if((it-begin)%%nplot==0 && it>begin){
+      par(mar=c(1,1.5,1.5,.5))
+     ## Plot clusters in pairwise scatter of gamma=1 vars
+      ind.cv <- which(gamma.now==1)
+      if(length(ind.cv) <= 6)
+        names.cv <- colnames(y)[ind.cv]
+      else
+        names.cv <- paste("y",ind.cv,sep="")
+      n.cv <- length(ind.cv)
+      indp <- 1
+      if(n.cv==1){
+        ind2 <- ifelse(ind.cv==1,2,1)
+        plot(yc.now[,ind.cv], yc.now[,ind2], col=phi.now, main=paste(names.cv[1],"by",colnames(y)[ind2]),pch=16)
+      }
+      else{
+        for(j in 1:(n.cv-1)){
+          for(k in (j+1):n.cv){
+            if(indp <= N.plots-2)
+	      plot(yc.now[,ind.cv[j]], yc.now[,ind.cv[k]], col=phi.now, pch=16, cex=.7, cex.axis=.8, mgp=c(2,.35,0))
+	      title(main=paste(names.cv[j],"by",names.cv[k]),line=.5, cex.main=.8)
+            indp <- indp + 1	  
+	  }
+        }
+      }
+     ## Bar plot of omega.now
+      omega.now <- update.vee(phi.now, delta.now, M=max(phi.now)+1)$omega
+      barplot(omega.now, main="omega")
+      abline(h=exp(-6), col=2)
+      abline(h=exp(-4), col=4)           
+    }
+  }
+  return(list(gamma=gamma, phi=phi, yc=yc, lambda=lambda, Psi=Psi, eta=eta, delta=delta, y=y, rho=rho, p.ad=p.ad, p.swap=p.swap, prop.sd.y.m=prop.sd.y.m, prop.sd.y.d=prop.sd.y.d, prop.sd.y.c=prop.sd.y.c, prop.sd.y2=prop.sd.y2, bsy=bsy))
+}
+
+
+
+
+####################################################################
+########### Get gamma hat and phi.hat for an MCMC output ###########
+####################################################################
+
+
+get.gamma.probs <- function(ans.DPMvs, post.ind=NULL){
+
+  p <- dim(ans.DPMvs$gamma)[2]
+  N.mcmc <- dim(ans.DPMvs$gamma)[1]
+  if(is.null(post.ind))
+    post.ind <- 1:N.mcmc
+  gamma.probs <- apply(ans.DPMvs$gamma[post.ind,],2,mean)
+  return(gamma.probs)
+}
+
+
+
+get.phi.hat <- function(ans.DPMvs, post.ind=NULL, M=NULL, pw.prob=NULL){
+
+  n <- dim(ans.DPMvs$phi)[2]
+  N.mcmc <- dim(ans.DPMvs$phi)[1]
+  if(is.null(post.ind))
+    post.ind <- 1:N.mcmc
+  N.mcmc <- length(post.ind)
+  phi <- ans.DPMvs$phi[post.ind,]
+  if(!is.null(M)){
+    foo <- apply(allDPM$phi,1,max)
+    ind.M <- which(foo==M)
+  }
+  else{
+    ind.M <- 1:dim(allDPM$phi)[1]
+  }
+  if(is.null(pw.prob)){
+    pw.prob <- foreach(i=1:n,.combine=rbind)%dopar%{
+      if(i%%10==0)
+        print(i)
+      ans.i <- rep(0,n)
+      for(j in 1:n)
+        ans.i[j] <- mean(phi[ind.M,i]==phi[ind.M,j])
+      ans.i
+    }
+  }
+  dist <- foreach(k=1:N.mcmc,.combine=rbind)%dopar%{
+    if(k%%100==0)
+      print(k)
+    if(!is.null(M) && max(phi[k,])!=M){
+      A.it <- 1E6
+    }
+    else{
+      A.it <- matrix(1,n,n)
+      for(i in 1:(n-1))
+        for(j in (i+1):n)
+          A.it[i,j] <- A.it[j,i] <- (phi[k,i]==phi[k,j])*1
+    }
+    c(sum(abs(A.it-pw.prob)), sum((A.it-pw.prob)^2))
+  }
+  ind1.min <- which(dist[,1]==min(dist[,1]))[1]
+  ind2.min <- which(dist[,2]==min(dist[,2]))[1]
+  phi.hat1 <- phi[ind1.min,]
+  phi.hat2 <- phi[ind2.min,]
+  
+  phi.hat2r <- phi.hat2
+  phi.hat1r <- try(refine.phi.hat(phi.hat1, pw.prob, ans.DPMvs, maxit=100, Nmax=5, pow=1), silent=TRUE)
+  if(is.character(phi.hat1r[1]))
+    phi.hat1r <- phi.hat1
+  phi.hat2r <- try(refine.phi.hat(phi.hat2, pw.prob, ans.DPMvs, maxit=100, Nmax=5, pow=2), silent=TRUE)
+  if(is.character(phi.hat2r[1]))
+    phi.hat2r <- phi.hat2
+    
+  return(list(phi.hat1=phi.hat1, phi.hat2=phi.hat2, phi.hat1r=phi.hat1r, phi.hat2r=phi.hat2r, ind1.min=post.ind[ind1.min], ind2.min=post.ind[ind2.min], pw.prob=pw.prob))
+}
+
+
+
+
+refine.phi.hat <- function(phi.hat, pw.prob, ans.DPMvs, maxit=20, Nmax=5, pow=2){
+
+## loop through each obs and consider it's best possible switch, according to sum((A.it-pw.prob)^2)
+## keep the best switch , iterate to convergence
+
+  n <- dim(ans.DPMvs$phi)[2]
+  M <- max(phi.hat)
+  phi.now <- phi.best <- phi.hat
+  Nneg <- 0
+  avail <- 1:n
+  acc.dist <- 0
+  
+  for(it in 1:maxit){
+
+print(it)
+
+    A.now <- matrix(1,n,n)
+      for(i in 1:(n-1))
+        for(j in (i+1):n)
+          A.now[i,j] <- A.now[j,i] <- (phi.now[i]==phi.now[j])*1
+    dist.now <- sum(abs(A.now-pw.prob)^pow)
+    m.dist <- foreach(i=1:n, .combine=rbind)%dopar%{
+      if(!any(avail==i))
+        ans.i <- c(phi.now[i], -Inf)
+      else{
+        dist.i.prev <- sum(abs(A.now[i,]-pw.prob[i,])^pow)
+        dist.i <- Inf
+        for(m in (1:M)[-phi.now[i]]){
+          a.im <- (phi.now==m)*1
+          a.im[i] <- 1
+          dist.im <- sum(abs(a.im-pw.prob[i,])^pow)
+          if(dist.im < dist.i){
+            mi.now <- m
+	    dist.i <- dist.im
+          }
+        }
+        ans.i <- c(mi.now, dist.i.prev-dist.i)
+      }
+      ans.i
+    }
+    ind.i <- which(m.dist[,2]==max(m.dist[,2]))[1]
+    phi.now[ind.i] <- m.dist[ind.i,1]
+    acc.dist <- acc.dist + m.dist[ind.i,2]
+    if(acc.dist > 0){
+      phi.best <- phi.now
+      Nneg <- 0
+      avail <- 1:n
+      acc.dist <- 0
+    }
+    else{
+      Nneg <- Nneg+1
+      avail <- avail[-ind.i]
+    }
+    if(Nneg==Nmax)
+      break
+  }
+  return(phi.best)
+}
+
+
+
+
+get.phi.hat2 <- function(phi.probs){
+
+  n <- nrow(phi.probs)
+  phi.hat2 <- rep(0,n)
+  for(i in 1:n)
+    phi.hat2[i] <- which(phi.probs[i,]==max(phi.probs[i,]))
+  return(phi.hat2)
+}
+
+
+
+get.phi.probs.hat <- function(ans.DPMvs, y.init, phi.init=NULL, post.ind=NULL, probs.now=NULL, maxit=100, Mmin=1, Mmax=8, tol=1E-8){
+
+  n <- dim(ans.DPMvs$phi)[2]
+  N.mcmc <- dim(ans.DPMvs$phi)[1]
+  if(is.null(post.ind))
+    post.ind <- 1:N.mcmc
+  foo <- apply(ans.DPMvs$phi[post.ind,],1,max)
+  ind.keep <- which(foo<=Mmax & foo>=Mmin)
+  post.ind <- post.ind[ind.keep]
+  phi.now <- ans.DPMvs$phi[post.ind,]
+  if(is.null(phi.init))
+    phi.init <- phi.now[1,]
+  m.rank <- order(-table(phi.init))
+  phi.init <- m.rank[phi.init]
+
+  M.init <- max(phi.init)
+  Mmax <- max(phi.now)
+
+  if(is.null(probs.now)){
+   ## initialize probs.now
+   ## initialize permutations of phi.now
+    mu.init <- matrix(0,M.init,dim(y.init)[2])
+    pi.init <- table(phi.init)/n
+    for(m in 1:M.init)
+      mu.init[m,] <- apply(y.init[phi.init==m,,drop=FALSE],2,mean)
+    phi.now <- foreach(k=1:length(post.ind), .combine=rbind)%dopar%{
+if(k%%1000==0)
+  print(k)
+      phi.k <- phi.now[k,]
+      M.k <- max(phi.k)
+      mu.k <- matrix(0,M.k,dim(y.init)[2])
+      pi.k <- table(phi.k)/n
+      for(m in 1:M.k)
+        mu.k[m,] <- apply(y.init[phi.k==m,,drop=FALSE],2,mean)
+      D1.k <- as.matrix(dist(rbind(mu.init,mu.k)))[1:M.init,(M.init+1):(M.init+M.k)]
+      D2.k <- as.matrix(dist(cbind(c(pi.init,pi.k))))[1:M.init,(M.init+1):(M.init+M.k)]
+      D1.k <- D1.k/max(D1.k)
+      D2.k <- D2.k/max(D2.k)
+      D.k <- D1.k+D2.k
+      foo.k <- rep(0,M.k)
+      avail <- rep(TRUE,M.k)
+      for(m in 1:min(M.k,M.init)){
+        foo.k[m] <- which(D.k[m,]==min(D.k[m,avail]))
+        avail[foo.k[m]] <- FALSE
+      }
+      if(any(avail))
+        foo.k <- c(foo.k,which(avail))
+      perm.k <- 1:M.k
+      perm.k[foo.k] <- 1:M.k
+      perm.k[phi.k]
+    }    
+    probs.now <- matrix(0,n,Mmax)
+    for(m in 1:Mmax)
+      probs.now[,m] <- apply(phi.now==m, 2, mean)
+  }
+
+  for(it in index(1,maxit)){
+
+print(it)
+
+    phi.now <- foreach(k=1:length(post.ind), .combine=rbind)%dopar%{
+if(k%%1000==0)
+  print(k)
+      phi.k <- phi.k.new <- phi.now[k,]
+      M.k <- max(phi.k)
+      perms.k <- permutations(n=Mmax, r=M.k)
+      np <- nrow(perms.k)
+      like.best <- -Inf
+      for(l in 1:np){
+        phi.kl <- perms.k[l,][phi.k]
+	like.l <- sum(log(probs.now[cbind(1:n,phi.kl)]))
+        if(like.l>like.best){
+	  phi.k.new <- phi.kl
+	  like.best <- like.l
+	}
+      }
+      phi.k.new
+    }
+    probs.new <- matrix(0,n,Mmax)
+    for(m in 1:Mmax)
+      probs.new[,m] <- apply(phi.now==m, 2, mean)
+    dist <- sum((probs.new-probs.now)^2)
+    probs.now <- probs.new
+    if(dist<tol)
+      break
+    if(it==maxit)
+      warning("reached maxit")
+  }
+  return(list(phi.now=phi.now, probs.now=probs.now))
+}
+
+
+
+
+
+
+
+
+
+
 
 
 ####################################
@@ -1442,486 +2002,6 @@ print(gamma.now)
 
 
 
-##############################################################
-######### DPM CLustering w/ Variable Selection MCMC ##########
-##############################################################
-
-
-DPMvs.MCMC <- function(y, rho=.5, p.ad=.45, p.swap=.45, A.lambda=1, B.lambda=1, prop.sd.lambda=.5, P.Psi=NULL, N.Psi=NULL, A.eta=1, B.eta=.1, prop.sd.eta=.5, A.delta=1, B.delta=.1, prop.sd.delta=NULL, N.mcmc=5000, every=1, nplot=10, nback=1000, dfp=20, maxplot=100, gamma.init=NULL, phi.init=NULL, G=2:5, begin=0, bsy=3, prop.sd.y.m=.25, prop.sd.y.d=.25, prop.sd.y.c=.25, etagp=1, TT=2, Lg=200, Lgp=20, Lgy=0, Lpy=0, Lgpy=0, discrete=NULL, limits=NULL, prop.sd.y1=NULL, prop.sd.y2=NULL, yc.init=NULL, Ly.init=100, groups=NULL){
-
- ## Create needed variables ##
-  n <- nrow(y)
-  p <- ncol(y)
-  if(is.null(prop.sd.y1))
-    prop.sd.y1 <- prop.sd.y.m
-  if(is.null(prop.sd.y2))
-    prop.sd.y2 <- prop.sd.y.d
-  if(is.null(discrete))
-    discrete <- rep(FALSE,p)
-  if(is.null(limits))
-    limits <- cbind(rep(-Inf,p), rep(Inf,p))
-  if(is.null(colnames(y)))
-    colnames(y) <- paste("y_",1:p,sep="")
-  if(length(rho)==1)
-    rho <- rep(rho, p)
-  if(is.null(groups))
-    groups <- rep(1,p)
-
-  if(is.null(N.Psi))
-    N.Psi <- (p+1)*1.1
-  if(is.null(P.Psi))
-    P.Psi <- diag(apply(y,2,var,na.rm=TRUE))
-  lambda.now <- A.lambda/B.lambda
-  eta.now <- A.eta/B.eta + p + etagp
-  delta.now <- A.delta/B.delta
-  Psi.now <- P.Psi*N.Psi
-
- ## initialize yc, phi, gamma, mu, Sigma, Beta, Gamma
-  cat("\nInitializing Clusters \n")
-  ans.init <- initialize.clusters(y, G, lambda.now, eta.now, Psi.now, bsy, prop.sd.y.m, prop.sd.y.d, prop.sd.y.c, gamma.init, phi.init, discrete, limits, yc.init, Ly.init, groups)
-  yc.now <- ans.init$yc.now
-  phi.now <- ans.init$phi.now
-  gamma.now <- ans.init$gamma.now
-
-cat("\nAllocating Memory for Posterior Objects \n")
-
- ## Allocate posterior objects for which to store MCMC samples
-  gamma <- matrix(0, (N.mcmc-begin)%/%every, p)
-  phi <- matrix(0, (N.mcmc-begin)%/%every, n)
-  lambda <- rep(0, (N.mcmc-begin)%/%every)
-  Psi <- array(0, c((N.mcmc-begin)%/%every, p, p))
-  eta <- rep(0, (N.mcmc-begin)%/%every)
-  delta <- rep(0, (N.mcmc-begin)%/%every)
-  NN <- length(y)
-  yc <- matrix(0, (N.mcmc-begin)%/%every, NN)
-  
-  accept.gamma <- rep(0, N.mcmc)
-  accept.phi <- rep(0, N.mcmc)
-  accept.gp <- rep(0, N.mcmc)
-  accept.gy <- rep(0, N.mcmc)
-  accept.py <- rep(0, N.mcmc)
-  accept.gpy <- rep(0, N.mcmc)
-  accept.lambda <- rep(0, N.mcmc)
-  accept.Psi <- rep(0, N.mcmc)
-  accept.eta <- rep(0, N.mcmc)
-  accept.delta <- rep(0, N.mcmc)
-
-  nb <- ceiling(n/bsy)
-  accept.yc.m <- rep(0, n)
-
- ################
- ## Begin MCMC ##
- ################
- cat("\n")
-  for(it in 1:N.mcmc){
-
-  cat("\nIteration", it, "out of", N.mcmc)
-
-
-discrete..<<-discrete
-
-#print("y update")
-    ans.yc <- update.yc(yc.now, y, phi.now, gamma.now, lambda.now, eta.now, Psi.now, bsy, prop.sd.y.m, prop.sd.y.d, prop.sd.y.c, discrete, limits)
-    yc.now <- ans.yc$yc.now
-    accept.yc.m <- accept.yc.m + ans.yc$accept.m
-
-#print("gamma update")
-  ## Update gamma
-  ans.gamma <- update.gamma(gamma.now, p.ad, p.swap, yc.now, phi.now, lambda.now, eta.now, Psi.now, rho, Lg, groups)
-  gamma.now <- ans.gamma$gamma
-  accept.gamma[it] <- ans.gamma$accept
-
-
-
-#print("phi split/merge update")
-#phi.now<<-phi.now
-#yc.now<<-yc.now
-#gamma.now<<-gamma.now
-#lambda.now<<-lambda.now
-#eta.now<<-eta.now
-#Psi.now<<-Psi.now
-#delta.now<<-delta.now
-
-    ans.phi <- update.phi.sm(phi.now, yc.now, gamma.now, lambda.now, eta.now, Psi.now, delta.now, TT)
-    phi.now <- ans.phi$phi
-    accept.phi[it] <- ans.phi$accept
-
-#print("gamma & y joint update")
-    ans.gy <- update.gamma.y(gamma.now, p.ad, p.swap, yc.now, y, phi.now, lambda.now, eta.now, Psi.now, rho, Lgy, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
-    gamma.now <- ans.gy$gamma
-    yc.now <- ans.gy$yc
-    accept.gy[it] <- ans.gy$accept
-
-
-#print("phi & y joint update")
-    ans.py <- update.phi.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, Lpy, discrete, limits, prop.sd.y1, prop.sd.y2)
-    phi.now <- ans.py$phi
-    yc.now <- ans.py$yc
-    accept.py[it] <- ans.py$accept
-
-
-#print("gamma phi & y joint update")
-#  if(runif(1)<1)
-#    ans.gpy <- update.gamma.phi.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, delta.now, Lgpy, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
-#  else
-#    ans.gpy <- update.gamma.phi.sm.y(gamma.now, phi.now, p.ad, p.swap, yc.now, y, lambda.now, eta.now, Psi.now, rho, delta.now, TT, discrete, limits, prop.sd.y1, prop.sd.y2, groups)
-#    gamma.now <- ans.gpy$gamma
-#    phi.now <- ans.gpy$phi
-#    yc.now <- ans.gpy$yc
-#    accept.gpy[it] <- ans.gpy$accept
-
-
-#print("gamma & phi joint update")
-    if(runif(1)<.5)
-      ans.gp <- update.gamma.phi(gamma.now, phi.now, p.ad, p.swap, yc.now, lambda.now, eta.now, Psi.now, rho, delta.now, Lgp, groups)
-    else
-      ans.gp <- update.gamma.phi.sm(gamma.now, phi.now, p.ad, p.swap, yc.now, lambda.now, eta.now, Psi.now, rho, delta.now, TT, groups)
-    gamma.now <- ans.gp$gamma
-    phi.now <- ans.gp$phi
-    accept.gp[it] <- ans.gp$accept
-
-
-
-#print("phi Gibbs update")
-    phi.now <- update.phi(phi.now, yc.now, gamma.now, lambda.now, eta.now, Psi.now, delta.now)
-
-
-#print("delta update")
-    ans.delta <- update.delta(delta.now, phi.now, A.delta, B.delta, prop.sd.delta, dfp)
-    delta.now <- ans.delta$delta.now
-    accept.delta[it] <- ans.delta$accept
-
-
-#print("lambda update")
-    ans.lambda <- update.lambda(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, A.lambda, B.lambda, prop.sd.lambda, dfp)
-    lambda.now <- ans.lambda$lambda.now
-    accept.lambda[it] <- ans.lambda$accept
-
-
-#print("Psi update")
-    ans.Psi <- update.Psi(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, P.Psi, N.Psi)
-    Psi.now <- ans.Psi$Psi.now
-    accept.Psi[it] <- ans.Psi$accept
-
-
-#print("eta update")
-    ans.eta <- update.eta(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now, A.eta, B.eta, prop.sd.eta, dfp, etagp)
-    eta.now <- ans.eta$eta
-    accept.eta[it] <- ans.eta$accept
-    
-
-#print("End of Updates")
-
-   ## record params.now in posterior sample
-    if(it>begin && (it-begin)%%every==0){
-
-      yc[(it-begin)/every,] <- yc.now
-      gamma[(it-begin)/every,] <- gamma.now
-      phi[(it-begin)/every,] <- phi.now
-      lambda[(it-begin)/every] <- lambda.now
-      Psi[(it-begin)/every,,] <- Psi.now
-      eta[(it-begin)/every] <- eta.now
-      delta[(it-begin)/every] <- delta.now
-     }
-
-yc.now..<<-yc.now
-
-   ## Summarize and Plot posterior
-    if((it-begin)%%nplot==0){
-      ncv <- sum(gamma.now)
-      N.plots <- min(maxplot, max(1,choose(ncv,2)) + 2)
-      cols <- min(13, ceiling(sqrt(N.plots)))
-      rows <- min(13, ceiling(N.plots/cols))
-      it.e <- floor((it-begin)/every)
-      ind.now <- max(1,floor(it.e/2),it.e-nback+1):max(1,it.e)
-      par(mfrow=c(rows,cols), mar=c(2,2,2,1))
-
-     ## Print likelihood
-      like.y <- get.like(yc.now, phi.now, gamma.now, lambda.now, eta.now, Psi.now)
-      cat("\nlog(like) =",like.y,"\n")
-
-     ## Print model
-      cat("\ngamma =",gamma.now,"\n")
-
-     ## Print acceptance %
-      cat("\ngamma acceptance = ", mean(accept.gamma[1:it]))
-      cat("\nphi acceptance = ", mean(accept.phi[1:it]))
-      cat("\ngamma & y acceptance = ", mean(accept.gy[1:it]))
-      cat("\nphi & y acceptance = ", mean(accept.py[1:it]))
-      cat("\ngamma phi & y acceptance = ", mean(accept.gpy[1:it]))
-      cat("\ngamma & phi acceptance = ", mean(accept.gp[1:it]))
-      cat("\nlambda acceptance = ", mean(accept.lambda[1:it]))
-      cat("\nPsi acceptance = ", mean(accept.Psi[1:it]))
-      cat("\neta acceptance = ", mean(accept.eta[1:it]))
-      cat("\ndelta acceptance = ", mean(accept.delta[1:it]))
-      cat("\nyc acceptance = ", summary(accept.yc.m/it))
-      cat("\n\n\n")
-    }
-    if((it-begin)%%nplot==0 && it>begin){
-      par(mar=c(1,1.5,1.5,.5))
-     ## Plot clusters in pairwise scatter of gamma=1 vars
-      ind.cv <- which(gamma.now==1)
-      if(length(ind.cv) <= 6)
-        names.cv <- colnames(y)[ind.cv]
-      else
-        names.cv <- paste("y",ind.cv,sep="")
-      n.cv <- length(ind.cv)
-      indp <- 1
-      if(n.cv==1){
-        ind2 <- ifelse(ind.cv==1,2,1)
-        plot(yc.now[,ind.cv], yc.now[,ind2], col=phi.now, main=paste(names.cv[1],"by",colnames(y)[ind2]),pch=16)
-      }
-      else{
-        for(j in 1:(n.cv-1)){
-          for(k in (j+1):n.cv){
-            if(indp <= N.plots-2)
-	      plot(yc.now[,ind.cv[j]], yc.now[,ind.cv[k]], col=phi.now, pch=16, cex=.7, cex.axis=.8, mgp=c(2,.35,0))
-	      title(main=paste(names.cv[j],"by",names.cv[k]),line=.5, cex.main=.8)
-            indp <- indp + 1	  
-	  }
-        }
-      }
-     ## Bar plot of omega.now
-      omega.now <- update.vee(phi.now, delta.now, M=max(phi.now)+1)$omega
-      barplot(omega.now, main="omega")
-      abline(h=exp(-6), col=2)
-      abline(h=exp(-4), col=4)           
-    }
-  }
-  return(list(gamma=gamma, phi=phi, yc=yc, lambda=lambda, Psi=Psi, eta=eta, delta=delta, y=y, rho=rho, p.ad=p.ad, p.swap=p.swap, prop.sd.y.m=prop.sd.y.m, prop.sd.y.d=prop.sd.y.d, prop.sd.y.c=prop.sd.y.c, prop.sd.y2=prop.sd.y2, bsy=bsy))
-}
-
-
-
-
-####################################################################
-########### Get gamma hat and phi.hat for an MCMC output ###########
-####################################################################
-
-get.phi.hat <- function(ans.DPMvs, post.ind=NULL, M=NULL, pw.prob=NULL){
-
-  n <- dim(ans.DPMvs$phi)[2]
-  N.mcmc <- dim(ans.DPMvs$phi)[1]
-  if(is.null(post.ind))
-    post.ind <- 1:N.mcmc
-  N.mcmc <- length(post.ind)
-  phi <- ans.DPMvs$phi[post.ind,]
-  if(!is.null(M)){
-    foo <- apply(allDPM$phi,1,max)
-    ind.M <- which(foo==M)
-  }
-  else{
-    ind.M <- 1:dim(allDPM$phi)[1]
-  }
-  if(is.null(pw.prob)){
-    pw.prob <- foreach(i=1:n,.combine=rbind)%dopar%{
-      if(i%%10==0)
-        print(i)
-      ans.i <- rep(0,n)
-      for(j in 1:n)
-        ans.i[j] <- mean(phi[ind.M,i]==phi[ind.M,j])
-      ans.i
-    }
-  }
-  dist <- foreach(k=1:N.mcmc,.combine=rbind)%dopar%{
-    if(k%%100==0)
-      print(k)
-    if(!is.null(M) && max(phi[k,])!=M){
-      A.it <- 1E6
-    }
-    else{
-      A.it <- matrix(1,n,n)
-      for(i in 1:(n-1))
-        for(j in (i+1):n)
-          A.it[i,j] <- A.it[j,i] <- (phi[k,i]==phi[k,j])*1
-    }
-    c(sum(abs(A.it-pw.prob)), sum((A.it-pw.prob)^2))
-  }
-  ind1.min <- which(dist[,1]==min(dist[,1]))[1]
-  ind2.min <- which(dist[,2]==min(dist[,2]))[1]
-  phi.hat1 <- phi[ind1.min,]
-  phi.hat2 <- phi[ind2.min,]
-  
-  phi.hat2r <- phi.hat2
-  phi.hat1r <- try(refine.phi.hat(phi.hat1, pw.prob, ans.DPMvs, maxit=100, Nmax=5, pow=1), silent=TRUE)
-  if(is.character(phi.hat1r[1]))
-    phi.hat1r <- phi.hat1
-  phi.hat2r <- try(refine.phi.hat(phi.hat2, pw.prob, ans.DPMvs, maxit=100, Nmax=5, pow=2), silent=TRUE)
-  if(is.character(phi.hat2r[1]))
-    phi.hat2r <- phi.hat2
-    
-  return(list(phi.hat1=phi.hat1, phi.hat2=phi.hat2, phi.hat1r=phi.hat1r, phi.hat2r=phi.hat2r, ind1.min=post.ind[ind1.min], ind2.min=post.ind[ind2.min], pw.prob=pw.prob))
-}
-
-
-
-
-refine.phi.hat <- function(phi.hat, pw.prob, ans.DPMvs, maxit=20, Nmax=5, pow=2){
-
-## loop through each obs and consider it's best possible switch, according to sum((A.it-pw.prob)^2)
-## keep the best switch , iterate to convergence
-
-  n <- dim(ans.DPMvs$phi)[2]
-  M <- max(phi.hat)
-  phi.now <- phi.best <- phi.hat
-  Nneg <- 0
-  avail <- 1:n
-  acc.dist <- 0
-  
-  for(it in 1:maxit){
-
-print(it)
-
-    A.now <- matrix(1,n,n)
-      for(i in 1:(n-1))
-        for(j in (i+1):n)
-          A.now[i,j] <- A.now[j,i] <- (phi.now[i]==phi.now[j])*1
-    dist.now <- sum(abs(A.now-pw.prob)^pow)
-    m.dist <- foreach(i=1:n, .combine=rbind)%dopar%{
-      if(!any(avail==i))
-        ans.i <- c(phi.now[i], -Inf)
-      else{
-        dist.i.prev <- sum(abs(A.now[i,]-pw.prob[i,])^pow)
-        dist.i <- Inf
-        for(m in (1:M)[-phi.now[i]]){
-          a.im <- (phi.now==m)*1
-          a.im[i] <- 1
-          dist.im <- sum(abs(a.im-pw.prob[i,])^pow)
-          if(dist.im < dist.i){
-            mi.now <- m
-	    dist.i <- dist.im
-          }
-        }
-        ans.i <- c(mi.now, dist.i.prev-dist.i)
-      }
-      ans.i
-    }
-    ind.i <- which(m.dist[,2]==max(m.dist[,2]))[1]
-    phi.now[ind.i] <- m.dist[ind.i,1]
-    acc.dist <- acc.dist + m.dist[ind.i,2]
-    if(acc.dist > 0){
-      phi.best <- phi.now
-      Nneg <- 0
-      avail <- 1:n
-      acc.dist <- 0
-    }
-    else{
-      Nneg <- Nneg+1
-      avail <- avail[-ind.i]
-    }
-    if(Nneg==Nmax)
-      break
-  }
-  return(phi.best)
-}
-
-
-
-
-get.phi.hat2 <- function(phi.probs){
-
-  n <- nrow(phi.probs)
-  phi.hat2 <- rep(0,n)
-  for(i in 1:n)
-    phi.hat2[i] <- which(phi.probs[i,]==max(phi.probs[i,]))
-  return(phi.hat2)
-}
-
-
-
-get.phi.probs.hat <- function(ans.DPMvs, y.init, phi.init=NULL, post.ind=NULL, probs.now=NULL, maxit=100, Mmin=1, Mmax=8, tol=1E-8){
-
-  n <- dim(ans.DPMvs$phi)[2]
-  N.mcmc <- dim(ans.DPMvs$phi)[1]
-  if(is.null(post.ind))
-    post.ind <- 1:N.mcmc
-  foo <- apply(ans.DPMvs$phi[post.ind,],1,max)
-  ind.keep <- which(foo<=Mmax & foo>=Mmin)
-  post.ind <- post.ind[ind.keep]
-  phi.now <- ans.DPMvs$phi[post.ind,]
-  if(is.null(phi.init))
-    phi.init <- phi.now[1,]
-  m.rank <- order(-table(phi.init))
-  phi.init <- m.rank[phi.init]
-
-  M.init <- max(phi.init)
-  Mmax <- max(phi.now)
-
-  if(is.null(probs.now)){
-   ## initialize probs.now
-   ## initialize permutations of phi.now
-    mu.init <- matrix(0,M.init,dim(y.init)[2])
-    pi.init <- table(phi.init)/n
-    for(m in 1:M.init)
-      mu.init[m,] <- apply(y.init[phi.init==m,,drop=FALSE],2,mean)
-    phi.now <- foreach(k=1:length(post.ind), .combine=rbind)%dopar%{
-if(k%%1000==0)
-  print(k)
-      phi.k <- phi.now[k,]
-      M.k <- max(phi.k)
-      mu.k <- matrix(0,M.k,dim(y.init)[2])
-      pi.k <- table(phi.k)/n
-      for(m in 1:M.k)
-        mu.k[m,] <- apply(y.init[phi.k==m,,drop=FALSE],2,mean)
-      D1.k <- as.matrix(dist(rbind(mu.init,mu.k)))[1:M.init,(M.init+1):(M.init+M.k)]
-      D2.k <- as.matrix(dist(cbind(c(pi.init,pi.k))))[1:M.init,(M.init+1):(M.init+M.k)]
-      D1.k <- D1.k/max(D1.k)
-      D2.k <- D2.k/max(D2.k)
-      D.k <- D1.k+D2.k
-      foo.k <- rep(0,M.k)
-      avail <- rep(TRUE,M.k)
-      for(m in 1:min(M.k,M.init)){
-        foo.k[m] <- which(D.k[m,]==min(D.k[m,avail]))
-        avail[foo.k[m]] <- FALSE
-      }
-      if(any(avail))
-        foo.k <- c(foo.k,which(avail))
-      perm.k <- 1:M.k
-      perm.k[foo.k] <- 1:M.k
-      perm.k[phi.k]
-    }    
-    probs.now <- matrix(0,n,Mmax)
-    for(m in 1:Mmax)
-      probs.now[,m] <- apply(phi.now==m, 2, mean)
-  }
-
-  for(it in index(1,maxit)){
-
-print(it)
-
-    phi.now <- foreach(k=1:length(post.ind), .combine=rbind)%dopar%{
-if(k%%1000==0)
-  print(k)
-      phi.k <- phi.k.new <- phi.now[k,]
-      M.k <- max(phi.k)
-      perms.k <- permutations(n=Mmax, r=M.k)
-      np <- nrow(perms.k)
-      like.best <- -Inf
-      for(l in 1:np){
-        phi.kl <- perms.k[l,][phi.k]
-	like.l <- sum(log(probs.now[cbind(1:n,phi.kl)]))
-        if(like.l>like.best){
-	  phi.k.new <- phi.kl
-	  like.best <- like.l
-	}
-      }
-      phi.k.new
-    }
-    probs.new <- matrix(0,n,Mmax)
-    for(m in 1:Mmax)
-      probs.new[,m] <- apply(phi.now==m, 2, mean)
-    dist <- sum((probs.new-probs.now)^2)
-    probs.now <- probs.new
-    if(dist<tol)
-      break
-    if(it==maxit)
-      warning("reached maxit")
-  }
-  return(list(phi.now=phi.now, probs.now=probs.now))
-}
-
-
-
 
 
 get.phi.probs.hat.old <- function(ans.DPMvs, post.ind=NULL, maxit=100, post.ind2=NULL, Mmax=8){
@@ -2016,19 +2096,6 @@ get.phi.hat.probs.old <- function(ans.DPMvs, phi.hat, post.ind=NULL, N.post=100)
 
 
 
-
-
-
-
-get.gamma.probs <- function(ans.DPMvs, post.ind=NULL){
-
-  p <- dim(ans.DPMvs$gamma)[2]
-  N.mcmc <- dim(ans.DPMvs$gamma)[1]
-  if(is.null(post.ind))
-    post.ind <- 1:N.mcmc
-  gamma.probs <- apply(ans.DPMvs$gamma[post.ind,],2,mean)
-  return(gamma.probs)
-}
 
 
 
